@@ -223,67 +223,127 @@ class PaymentResponse
             'payment_method' => $data['payment_method'] ?? null,
             'callback' => $additional_data['callback'] ?? null,
             'is_partial' => $additional_data['is_partial'] ?? 0,
+            'is_due_payment' => $additional_data['is_due_payment'] ?? 0,
+            'paid_amount' => $additional_data['paid_amount'] ?? 0,
+            'due_amount' => $additional_data['due_amount'] ?? 0,
             'wallet_paid_amount' => $additional_data['wallet_paid_amount'] ?? 0,
             'digitally_paid_amount' => $additional_data['digitally_paid_amount'] ?? 0,
         ]);
 
         if (!is_null($request['booking_id'])) {
-            $booking = Booking::find($request['booking_id']);
-            $booking->is_paid = 1;
-            $booking->payment_method = $request['payment_method'];
-            $booking->transaction_id = $tran_id;
-            $booking->save();
+            $booking = Booking::with('booking_partial_payments')->find($request['booking_id']);
+            if ($booking) {
+                $paymentMethod = $request['payment_method'] ?? $data['payment_method'] ?? 'digital';
+                $paidAmount = (float) ($request['paid_amount'] > 0 ? $request['paid_amount'] : ($data['payment_amount'] ?? 0));
+                $hasExistingPartials = $booking->booking_partial_payments && $booking->booking_partial_payments->isNotEmpty();
 
-            placeBookingTransactionForDigitalPayment($booking);  //digital payment
+                if ($request['is_due_payment'] == 1 || $hasExistingPartials) {
+                    // Remaining due payment (e.g. 75%)
+                    $booking->booking_partial_payments()->update(['due_amount' => 0]);
 
-            if ($booking->booking_partial_payments->isNotEmpty()) {
-                // Update rows where `paid_with to digital` is not 'wallet'
-                $booking->booking_partial_payments()
-                    ->where('paid_with', '!=', 'wallet')
-                    ->update(['paid_with' => 'digital']);
-            }
+                    BookingPartialPayment::create([
+                        'booking_id' => $booking->id,
+                        'paid_with' => $paymentMethod,
+                        'paid_amount' => $paidAmount,
+                        'due_amount' => 0,
+                    ]);
 
-            if ($request['is_partial']) {
-                // Save wallet payment
-                BookingPartialPayment::create([
-                    'booking_id' => $booking->id,
-                    'paid_with' => 'wallet',
-                    'paid_amount' => $request['wallet_paid_amount'],
-                    'due_amount' => $request['digitally_paid_amount'],
-                ]);
+                    $booking->is_paid = 1;
+                    $booking->payment_method = $paymentMethod;
+                    $booking->transaction_id = $tran_id;
+                    $booking->save();
 
-                // Save remaining payment
-                BookingPartialPayment::create([
-                    'booking_id' => $booking->id,
-                    'paid_with' => 'digital',
-                    'paid_amount' => $request['digitally_paid_amount'],
-                    'due_amount' => 0,
-                ]);
+                    // Credit admin balance for remaining payment
+                    $admin_user = User::where('user_type', ADMIN_USER_TYPES[0])->first();
+                    if ($admin_user) {
+                        $account = Account::where('user_id', $admin_user->id)->first();
+                        if ($account) {
+                            $account->balance_pending += $paidAmount;
+                            $account->save();
+                        }
+                        Transaction::create([
+                            'ref_trx_id' => null,
+                            'booking_id' => $booking->id,
+                            'trx_type' => TRX_TYPE['booking_amount'],
+                            'debit' => 0,
+                            'credit' => $paidAmount,
+                            'balance' => $account ? $account->balance_pending : 0,
+                            'from_user_id' => $booking->customer_id,
+                            'to_user_id' => $admin_user->id,
+                            'from_user_account' => null,
+                            'to_user_account' => ACCOUNT_STATES[0]['value'],
+                            'is_guest' => $booking->is_guest
+                        ]);
+                    }
+                } elseif ($request['is_partial'] == 1) {
+                    // Initial partial payment (25%) via switch
+                    $dueAmount = round((float)$booking->total_booking_amount - $paidAmount, 2);
+                    BookingPartialPayment::create([
+                        'booking_id' => $booking->id,
+                        'paid_with' => $paymentMethod,
+                        'paid_amount' => $paidAmount,
+                        'due_amount' => $dueAmount,
+                    ]);
 
-                placeBookingTransactionForPartialDigital($booking);  //wallet + digital payment
-            }
+                    $booking->is_paid = 0; // Not fully paid yet
+                    $booking->payment_method = $paymentMethod;
+                    $booking->transaction_id = $tran_id;
+                    $booking->save();
 
-            // Also update CarBooking if ID exists
-            if (!is_null($request['car_booking_id'])) {
-                $carBooking = CarBooking::find($request['car_booking_id']);
-                if ($carBooking) {
-                    $carBooking->is_paid = 1;
-                    $carBooking->payment_status = 'paid';
-                    $carBooking->payment_method = $request['payment_method'];
-                    $carBooking->transaction_id = $tran_id;
-                    $carBooking->save();
+                    // Credit admin balance for 25% payment
+                    $admin_user = User::where('user_type', ADMIN_USER_TYPES[0])->first();
+                    if ($admin_user) {
+                        $account = Account::where('user_id', $admin_user->id)->first();
+                        if ($account) {
+                            $account->balance_pending += $paidAmount;
+                            $account->save();
+                        }
+                        Transaction::create([
+                            'ref_trx_id' => null,
+                            'booking_id' => $booking->id,
+                            'trx_type' => TRX_TYPE['booking_amount'],
+                            'debit' => 0,
+                            'credit' => $paidAmount,
+                            'balance' => $account ? $account->balance_pending : 0,
+                            'from_user_id' => $booking->customer_id,
+                            'to_user_id' => $admin_user->id,
+                            'from_user_account' => null,
+                            'to_user_account' => ACCOUNT_STATES[0]['value'],
+                            'is_guest' => $booking->is_guest
+                        ]);
+                    }
+                } else {
+                    // Full 100% payment
+                    $booking->is_paid = 1;
+                    $booking->payment_method = $paymentMethod;
+                    $booking->transaction_id = $tran_id;
+                    $booking->save();
 
-                    // Specific Car Booking Transaction
-                    placeCarBookingTransactionForDigitalPayment($carBooking);
+                    placeBookingTransactionForDigitalPayment($booking);
                 }
+
+                // Also update CarBooking if ID exists
+                if (!is_null($request['car_booking_id'])) {
+                    $carBooking = CarBooking::find($request['car_booking_id']);
+                    if ($carBooking) {
+                        $carBooking->is_paid = 1;
+                        $carBooking->payment_status = 'paid';
+                        $carBooking->payment_method = $paymentMethod;
+                        $carBooking->transaction_id = $tran_id;
+                        $carBooking->save();
+
+                        placeCarBookingTransactionForDigitalPayment($carBooking);
+                    }
+                }
+
+                $response = [
+                    'flag' => 'success',
+                    'booking_id' => $booking->id,
+                    'readable_id' => $booking->readable_id
+                ];
+            } else {
+                $response = ['flag' => 'failed', 'message' => 'Booking not found'];
             }
-
-            $response = [
-                'flag' => 'success',
-                'booking_id' => $booking->id,
-                'readable_id' => $booking->readable_id
-            ];
-
         }
 
         //update payment request

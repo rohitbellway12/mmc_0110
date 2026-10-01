@@ -908,64 +908,69 @@ class BookingController extends Controller
             'payment_method' => 'required',
             'offline_payment_id' => 'required_if:payment_method,offline_payment',
             'customer_information' => 'required_if:payment_method,offline_payment',
-            'is_partial' => 'required|in:0,1',
+            'is_partial' => 'nullable|in:0,1',
         ]);
 
         if ($validator->fails()) {
             return response()->json(response_formatter(DEFAULT_400, null, error_processor($validator)), 400);
         }
 
-        // Retrieve booking
-        $booking = $this->booking->find($request->booking_id);
+        // Retrieve booking with partial payments
+        $booking = $this->booking->with('booking_partial_payments')->find($request->booking_id);
         if (!$booking) {
             return response()->json(response_formatter(DEFAULT_204), 200);
         }
 
-        // Handle partial payment if applicable
-        if ($request->is_partial) {
-            $user = auth('api')->user();
-            $walletBalance = $user->wallet_balance;
+        // Check existing partial payment status
+        $hasPartialPayments = $booking->booking_partial_payments && $booking->booking_partial_payments->isNotEmpty();
+        $latestPartial = $hasPartialPayments ? $booking->booking_partial_payments->sortByDesc('created_at')->first() : null;
+        $totalPaid = $hasPartialPayments ? (float) $booking->booking_partial_payments->sum('paid_amount') : 0;
+        $remainingDue = 0;
 
-            if ($walletBalance <= 0 || $walletBalance >= $booking->total_booking_amount) {
-                return response()->json(response_formatter(DEFAULT_400, null, 'Invalid partial payment data.'), 400);
-            }
-
-            $paidAmount = $walletBalance;
-            $dueAmount = $booking->total_booking_amount - $paidAmount;
-
-            // Save wallet payment
-            BookingPartialPayment::create([
-                'booking_id' => $booking->id,
-                'paid_with' => 'wallet',
-                'paid_amount' => $paidAmount,
-                'due_amount' => $dueAmount,
-            ]);
-
-            // Save remaining payment
-            BookingPartialPayment::create([
-                'booking_id' => $booking->id,
-                'paid_with' => 'digital',
-                'paid_amount' => $dueAmount,
-                'due_amount' => 0,
-            ]);
+        if ($hasPartialPayments) {
+            $remainingDue = ($latestPartial && $latestPartial->due_amount > 0)
+                ? (float) $latestPartial->due_amount
+                : max(0, round((float) $booking->total_booking_amount - $totalPaid, 2));
         }
 
-        // Handle payment method updates
+        // Handle cash after service switch
         if ($request->payment_method == 'cash_after_service') {
-            $booking->update(['payment_method' => 'cash_after_service', 'transaction_id' => 'cash-payment', 'is_verified' => 1]);
-            if ($booking->booking_partial_payments->isNotEmpty()) {
-                // Delete rows where `paid_with` is not 'wallet'
-                $booking->booking_partial_payments()
-                    ->where('paid_with', '!=', 'wallet')
-                    ->delete();
-            }
-            if ($request->is_partial) {
-                placeBookingTransactionForPartialCas($booking);
-            }
+            $booking->update([
+                'payment_method' => 'cash_after_service',
+                'transaction_id' => 'cash-payment',
+                'is_verified' => 1
+            ]);
+            return response()->json(response_formatter(PAYMENT_METHOD_UPDATE_200), 200);
 
         } elseif ($request->payment_method == 'wallet_payment') {
-            $booking->update(['payment_method' => 'wallet_payment', 'transaction_id' => 'wallet-payment']);
+            $user = auth('api')->user();
+            $amountToPay = ($hasPartialPayments && $remainingDue > 0) ? $remainingDue : (float) $booking->total_booking_amount;
+
+            if ($user->wallet_balance < $amountToPay) {
+                return response()->json(response_formatter(INSUFFICIENT_WALLET_BALANCE_400), 400);
+            }
+
+            $user->wallet_balance -= $amountToPay;
+            $user->save();
+
+            if ($hasPartialPayments && $remainingDue > 0) {
+                $booking->booking_partial_payments()->update(['due_amount' => 0]);
+                BookingPartialPayment::create([
+                    'booking_id' => $booking->id,
+                    'paid_with' => 'wallet',
+                    'paid_amount' => $amountToPay,
+                    'due_amount' => 0,
+                ]);
+            }
+
+            $booking->update([
+                'payment_method' => 'wallet_payment',
+                'transaction_id' => 'wallet-payment',
+                'is_paid' => 1
+            ]);
             placeBookingTransactionForWalletPayment($booking);
+
+            return response()->json(response_formatter(PAYMENT_METHOD_UPDATE_200), 200);
 
         } elseif (in_array($request->payment_method, array_column(PAYMENT_METHODS, 'key'))) {
             // Digital Payment (e.g., Stripe)
@@ -977,15 +982,23 @@ class BookingController extends Controller
 
             $attribute = 'booking_id';
             $attribute_id = $booking->readable_id;
-            $amount = $booking->total_booking_amount;
 
-            if ($request->is_partial) {
-                $user = auth('api')->user();
-                $amount = $booking->total_booking_amount - $user->wallet_balance;
+            $isDuePayment = false;
+            if ($hasPartialPayments && $remainingDue > 0) {
+                // Paying remaining 75% due amount
+                $amount = $remainingDue;
+                $isDuePayment = true;
+            } elseif ($request->is_partial == 1) {
+                // First-time partial payment (25%)
+                $amount = round($booking->total_booking_amount * 0.25, 2);
+            } else {
+                // Full payment
+                $amount = (float) $booking->total_booking_amount;
             }
 
-            $success_hook = 'digital_payment_success';
-            $failure_hook = 'digital_payment_fail';
+            // Hook must be switch_offline_to_digital_payment_success to update existing booking, not digital_payment_success which creates new booking!
+            $success_hook = 'switch_offline_to_digital_payment_success';
+            $failure_hook = 'switch_offline_to_digital_payment_fail';
 
             if ($car_booking) {
                 $attribute = 'car_booking_id';
@@ -1005,6 +1018,10 @@ class BookingController extends Controller
                 receiver_id: null,
                 additional_data: [
                     'booking_id' => $booking->id,
+                    'is_due_payment' => $isDuePayment ? 1 : 0,
+                    'is_partial' => ($request->is_partial == 1 && !$isDuePayment) ? 1 : 0,
+                    'paid_amount' => $amount,
+                    'due_amount' => $isDuePayment ? 0 : round($booking->total_booking_amount - $amount, 2),
                     'callback' => $request->callback
                 ],
                 payment_amount: $amount,

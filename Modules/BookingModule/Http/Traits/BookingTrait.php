@@ -111,7 +111,7 @@ trait BookingTrait
                 $booking->sub_category_id = $subCategory;
                 $booking->zone_id = $zoneId;
                 $booking->booking_status = 'pending';
-                $booking->is_paid = $request['payment_method'] == 'cash_after_service' || $request['payment_method'] == 'offline_payment' ? 0 : 1;
+                $booking->is_paid = ($isPartials || in_array($request['payment_method'], ['cash_after_service', 'offline_payment'])) ? 0 : 1;
                 $booking->payment_method = $request['payment_method'];
                 $booking->transaction_id = $transactionId;
                 $booking->total_booking_amount = $totalBookingAmount;
@@ -769,7 +769,7 @@ trait BookingTrait
             $booking->sub_category_id = $data['sub_category_id'];
             $booking->zone_id = $data['zone_id'];
             $booking->booking_status = 'accepted';
-            $booking->is_paid = in_array($data['payment_method'], ['cash_after_service', 'offline_payment']) ? 0 : 1;
+            $booking->is_paid = ($isPartials || in_array($data['payment_method'], ['cash_after_service', 'offline_payment'])) ? 0 : 1;
             $booking->payment_method = $data['payment_method'];
             $booking->transaction_id = $transactionId;
             $booking->total_booking_amount = $totalBookingAmount;
